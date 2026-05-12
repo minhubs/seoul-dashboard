@@ -3,10 +3,11 @@ import pandas as pd
 import sqlite3
 import plotly.express as px
 from pathlib import Path
+import unicodedata
 
-# -----------------------------
+# =========================================================
 # 페이지 기본 설정
-# -----------------------------
+# =========================================================
 st.set_page_config(
     page_title="서울시 문화/관광/행사 통합 대시보드",
     layout="wide"
@@ -15,55 +16,263 @@ st.set_page_config(
 st.title("🏛️ 서울시 문화/관광/행사 통합 대시보드")
 st.caption("서울시 공공데이터를 활용한 문화공간 분포 및 문화 접근성 분석")
 
-# -----------------------------
-# 파일 경로 설정
-# -----------------------------
 BASE_DIR = Path(__file__).parent
 
 
-# -----------------------------
-# CSV 파일 자동 찾기 함수
-# -----------------------------
-def find_csv_file(keyword):
+# =========================================================
+# 한글 파일명/컬럼명 정규화 함수
+# =========================================================
+def normalize_text(text):
     """
-    app.py와 같은 폴더에서 특정 키워드가 들어간 CSV 파일을 자동으로 찾는 함수
-    예: keyword='문화공간' → '서울시 문화공간 정보.csv' 자동 탐색
+    한글 파일명/컬럼명 인식 오류를 줄이기 위한 정규화 함수
+    - 맥북/깃허브/Streamlit Cloud에서 한글 조합 방식이 달라지는 문제 방지
+    - 공백, 언더바, 하이픈 제거
     """
-    files = sorted(BASE_DIR.glob(f"*{keyword}*.csv"))
+    text = str(text)
+    text = unicodedata.normalize("NFC", text)
+    text = unicodedata.normalize("NFKC", text)
+    text = text.replace(" ", "")
+    text = text.replace("_", "")
+    text = text.replace("-", "")
+    text = text.lower()
+    return text
 
-    if len(files) == 0:
-        return None
 
-    return files[0]
-
-
-# -----------------------------
-# CSV 안전하게 읽기 함수
-# -----------------------------
+# =========================================================
+# CSV 안전하게 읽기
+# =========================================================
 def read_csv_safely(file_path):
     """
-    CSV 파일의 인코딩 문제를 줄이기 위해 여러 인코딩으로 읽어보는 함수
+    CSV 인코딩 문제를 피하기 위해 여러 인코딩으로 읽기 시도
     """
     encodings = ["utf-8-sig", "utf-8", "cp949", "euc-kr"]
+
+    last_error = None
 
     for enc in encodings:
         try:
             return pd.read_csv(file_path, encoding=enc)
-        except UnicodeDecodeError:
+        except UnicodeDecodeError as e:
+            last_error = e
+            continue
+        except Exception as e:
+            last_error = e
             continue
 
-    # 위 인코딩으로 모두 실패하면 기본 방식으로 마지막 시도
-    return pd.read_csv(file_path)
+    st.error(f"❌ CSV 파일을 읽을 수 없습니다: {file_path.name}")
+    st.write("마지막 오류:", last_error)
+    st.stop()
 
 
-# -----------------------------
-# 문화공간 컬럼 정리 함수
-# -----------------------------
+# =========================================================
+# 현재 폴더의 CSV 파일 모두 찾기
+# =========================================================
+def get_csv_files():
+    """
+    app.py가 있는 폴더와 하위 폴더에서 CSV 파일 탐색
+    단, .git 폴더는 제외
+    """
+    csv_files = []
+
+    for p in BASE_DIR.rglob("*.csv"):
+        if ".git" in p.parts:
+            continue
+        csv_files.append(p)
+
+    return sorted(csv_files)
+
+
+# =========================================================
+# 파일 판별 점수 계산
+# =========================================================
+def get_column_names(df):
+    return [normalize_text(c) for c in df.columns]
+
+
+def score_culture_file(file_path, df):
+    """
+    문화공간 파일인지 판별하는 점수
+    파일명뿐 아니라 컬럼명까지 같이 봄
+    """
+    name = normalize_text(file_path.name)
+    cols = get_column_names(df)
+
+    score = 0
+
+    # 파일명 기준
+    if "문화공간" in name:
+        score += 100
+    if "문화" in name and "공간" in name:
+        score += 80
+
+    # 컬럼명 기준
+    if "문화시설명" in cols or "facname" in cols:
+        score += 120
+    if "주제분류" in cols or "subjcode" in cols:
+        score += 40
+    if "자치구" in cols or "gngu" in cols:
+        score += 40
+    if "무료구분" in cols or "entrfree" in cols:
+        score += 40
+    if "위도" in cols or "xcoord" in cols:
+        score += 20
+    if "경도" in cols or "ycoord" in cols:
+        score += 20
+
+    return score
+
+
+def score_tour_file(file_path, df):
+    """
+    관광명소 파일인지 판별하는 점수
+    """
+    name = normalize_text(file_path.name)
+    cols = get_column_names(df)
+
+    score = 0
+
+    if "관광명소" in name:
+        score += 100
+    elif "관광" in name:
+        score += 80
+
+    if "상호명" in cols:
+        score += 50
+    if "신주소" in cols:
+        score += 40
+    if "태그" in cols:
+        score += 30
+    if "관광지명" in cols:
+        score += 50
+
+    return score
+
+
+def score_event_file(file_path, df):
+    """
+    문화행사 파일인지 판별하는 점수
+    """
+    name = normalize_text(file_path.name)
+    cols = get_column_names(df)
+
+    score = 0
+
+    if "문화행사" in name:
+        score += 120
+    elif "행사" in name:
+        score += 80
+
+    if "공연/행사명" in [str(c).strip() for c in df.columns]:
+        score += 80
+    if "공연행사명" in cols:
+        score += 80
+    if "행사명" in cols:
+        score += 50
+    if "장소" in cols:
+        score += 30
+    if "분류" in cols:
+        score += 20
+
+    return score
+
+
+# =========================================================
+# CSV 파일 자동 분류
+# =========================================================
+def load_and_classify_csv_files():
+    """
+    폴더 안 CSV 파일을 모두 읽고,
+    문화공간 / 관광명소 / 문화행사 파일을 자동 판별
+    """
+    csv_files = get_csv_files()
+
+    if not csv_files:
+        st.error("❌ CSV 파일을 찾을 수 없습니다.")
+        st.write("현재 폴더 파일 목록:")
+        st.write([p.name for p in BASE_DIR.iterdir()])
+        st.stop()
+
+    loaded = []
+
+    for file in csv_files:
+        df_temp = read_csv_safely(file)
+        loaded.append({
+            "path": file,
+            "df": df_temp,
+            "culture_score": score_culture_file(file, df_temp),
+            "tour_score": score_tour_file(file, df_temp),
+            "event_score": score_event_file(file, df_temp),
+        })
+
+    # 점수 높은 파일 선택
+    culture_item = max(loaded, key=lambda x: x["culture_score"])
+    tour_item = max(loaded, key=lambda x: x["tour_score"])
+    event_item = max(loaded, key=lambda x: x["event_score"])
+
+    # 문화공간 파일은 필수
+    if culture_item["culture_score"] <= 0:
+        st.error("❌ 문화공간 CSV 파일을 판별하지 못했습니다.")
+        st.write("현재 발견된 CSV 파일 목록:")
+        st.write([item["path"].name for item in loaded])
+
+        st.write("파일별 판별 점수:")
+        score_table = pd.DataFrame([
+            {
+                "파일명": item["path"].name,
+                "문화공간점수": item["culture_score"],
+                "관광명소점수": item["tour_score"],
+                "문화행사점수": item["event_score"],
+                "컬럼": list(item["df"].columns)
+            }
+            for item in loaded
+        ])
+        st.dataframe(score_table, use_container_width=True)
+        st.stop()
+
+    culture_path = culture_item["path"]
+    culture_df = culture_item["df"]
+
+    # 관광/행사는 선택 데이터
+    if tour_item["tour_score"] > 0 and tour_item["path"] != culture_path:
+        tour_path = tour_item["path"]
+        tour_df = tour_item["df"]
+    else:
+        tour_path = None
+        tour_df = pd.DataFrame()
+
+    if event_item["event_score"] > 0 and event_item["path"] != culture_path:
+        event_path = event_item["path"]
+        event_df = event_item["df"]
+    else:
+        event_path = None
+        event_df = pd.DataFrame()
+
+    return culture_df, tour_df, event_df, culture_path, tour_path, event_path, loaded
+
+
+# =========================================================
+# 컬럼명 정리
+# =========================================================
+def clean_column_names(df):
+    """
+    컬럼명 앞뒤 공백 제거 + 한글 정규화
+    """
+    df = df.copy()
+    df.columns = [
+        unicodedata.normalize("NFC", str(col)).strip()
+        for col in df.columns
+    ]
+    return df
+
+
+# =========================================================
+# 문화공간 데이터 정리
+# =========================================================
 def normalize_culture_columns(df):
     """
-    문화공간 데이터 컬럼명을 대시보드에서 쓰기 쉽게 통일
-    공공데이터 컬럼명이 한글/영어 어느 쪽이어도 대응
+    문화공간 데이터 컬럼명을 대시보드용으로 통일
     """
+    df = clean_column_names(df)
 
     rename_map = {
         "문화시설명": "시설명",
@@ -117,22 +326,22 @@ def normalize_culture_columns(df):
 
     df = df.rename(columns=rename_map)
 
-    # 필요한 컬럼이 없으면 오류 대신 '정보없음'으로 생성
     required_cols = [
         "시설명", "자치구", "유형", "주소",
         "위도", "경도", "무료구분",
-        "관람료", "관람시간", "휴관일", "홈페이지", "전화번호"
+        "관람료", "관람시간", "휴관일",
+        "홈페이지", "전화번호"
     ]
 
     for col in required_cols:
         if col not in df.columns:
             df[col] = "정보없음"
 
-    # 위도/경도 숫자형 변환
+    # 위도, 경도 숫자 변환
     df["위도"] = pd.to_numeric(df["위도"], errors="coerce")
     df["경도"] = pd.to_numeric(df["경도"], errors="coerce")
 
-    # 결측치 정리
+    # 텍스트 컬럼 결측 처리
     text_cols = [
         "시설명", "자치구", "유형", "주소",
         "무료구분", "관람료", "관람시간",
@@ -141,22 +350,21 @@ def normalize_culture_columns(df):
 
     for col in text_cols:
         df[col] = df[col].fillna("정보없음")
+        df[col] = df[col].astype(str)
+        df[col] = df[col].replace("nan", "정보없음")
         df[col] = df[col].replace("", "정보없음")
 
     return df[required_cols]
 
 
-# -----------------------------
-# 관광명소 컬럼 정리 함수
-# -----------------------------
+# =========================================================
+# 관광명소 데이터 정리
+# =========================================================
 def normalize_tour_columns(tour):
-    """
-    관광명소 데이터 컬럼명을 통일
-    파일이 없거나 컬럼명이 달라도 앱이 멈추지 않게 처리
-    """
-
     if tour.empty:
         return pd.DataFrame(columns=["시설명", "주소", "유형"])
+
+    tour = clean_column_names(tour)
 
     rename_map = {
         "상호명": "시설명",
@@ -179,24 +387,22 @@ def normalize_tour_columns(tour):
         if col not in tour.columns:
             tour[col] = "정보없음"
 
-    tour["시설명"] = tour["시설명"].fillna("정보없음")
-    tour["주소"] = tour["주소"].fillna("정보없음")
-    tour["유형"] = tour["유형"].fillna("정보없음")
+        tour[col] = tour[col].fillna("정보없음")
+        tour[col] = tour[col].astype(str)
+        tour[col] = tour[col].replace("nan", "정보없음")
+        tour[col] = tour[col].replace("", "정보없음")
 
     return tour[["시설명", "주소", "유형"]]
 
 
-# -----------------------------
-# 문화행사 컬럼 정리 함수
-# -----------------------------
+# =========================================================
+# 문화행사 데이터 정리
+# =========================================================
 def normalize_event_columns(event):
-    """
-    문화행사 데이터 컬럼명을 통일
-    파일이 없거나 컬럼명이 달라도 앱이 멈추지 않게 처리
-    """
-
     if event.empty:
         return pd.DataFrame(columns=["시설명", "주소", "유형"])
+
+    event = clean_column_names(event)
 
     rename_map = {
         "공연/행사명": "시설명",
@@ -218,70 +424,48 @@ def normalize_event_columns(event):
         if col not in event.columns:
             event[col] = "정보없음"
 
-    event["시설명"] = event["시설명"].fillna("정보없음")
-    event["주소"] = event["주소"].fillna("정보없음")
-    event["유형"] = event["유형"].fillna("정보없음")
+        event[col] = event[col].fillna("정보없음")
+        event[col] = event[col].astype(str)
+        event[col] = event[col].replace("nan", "정보없음")
+        event[col] = event[col].replace("", "정보없음")
 
     return event[["시설명", "주소", "유형"]]
 
 
-# -----------------------------
+# =========================================================
 # 데이터 로드
-# -----------------------------
-@st.cache_data
-def load_data():
-    """
-    CSV 파일을 불러와서 대시보드 분석에 맞게 정리
-    문화공간 파일은 필수, 관광명소/문화행사 파일은 선택
-    """
+# =========================================================
+raw_culture, raw_tour, raw_event, culture_path, tour_path, event_path, loaded_files = load_and_classify_csv_files()
 
-    culture_path = find_csv_file("문화공간")
-    tour_path = find_csv_file("관광")
-    event_path = find_csv_file("문화행사")
-
-    # 문화공간 파일은 필수
-    if culture_path is None:
-        st.error("❌ 문화공간 CSV 파일을 찾을 수 없습니다.")
-        st.write("app.py와 같은 폴더에 '문화공간'이라는 단어가 들어간 CSV 파일을 넣어주세요.")
-        st.write("현재 폴더 파일 목록:")
-        st.write([p.name for p in BASE_DIR.glob("*")])
-        st.stop()
-
-    df = read_csv_safely(culture_path)
-    df = normalize_culture_columns(df)
-
-    # 관광명소 파일은 선택
-    if tour_path is not None:
-        tour = read_csv_safely(tour_path)
-        tour = normalize_tour_columns(tour)
-    else:
-        tour = pd.DataFrame(columns=["시설명", "주소", "유형"])
-
-    # 문화행사 파일은 선택
-    if event_path is not None:
-        event = read_csv_safely(event_path)
-        event = normalize_event_columns(event)
-    else:
-        event = pd.DataFrame(columns=["시설명", "주소", "유형"])
-
-    return df, tour, event, culture_path, tour_path, event_path
+df = normalize_culture_columns(raw_culture)
+tour = normalize_tour_columns(raw_tour)
+event = normalize_event_columns(raw_event)
 
 
-df, tour, event, culture_path, tour_path, event_path = load_data()
-
-
-# -----------------------------
+# =========================================================
 # 불러온 파일 확인
-# -----------------------------
-with st.expander("📁 불러온 파일 확인"):
+# =========================================================
+with st.expander("📁 불러온 파일 확인 / 디버깅"):
     st.write("문화공간 파일:", culture_path.name if culture_path else "없음")
     st.write("관광명소 파일:", tour_path.name if tour_path else "없음")
     st.write("문화행사 파일:", event_path.name if event_path else "없음")
 
+    debug_df = pd.DataFrame([
+        {
+            "파일명": item["path"].name,
+            "문화공간점수": item["culture_score"],
+            "관광명소점수": item["tour_score"],
+            "문화행사점수": item["event_score"],
+            "컬럼수": len(item["df"].columns)
+        }
+        for item in loaded_files
+    ])
+    st.dataframe(debug_df, use_container_width=True)
 
-# -----------------------------
+
+# =========================================================
 # SQLite DB 생성
-# -----------------------------
+# =========================================================
 conn = sqlite3.connect(":memory:")
 
 df.to_sql("culture_space", conn, index=False, if_exists="replace")
@@ -289,9 +473,9 @@ tour.to_sql("tour_place", conn, index=False, if_exists="replace")
 event.to_sql("culture_event", conn, index=False, if_exists="replace")
 
 
-# -----------------------------
+# =========================================================
 # 사이드바 필터
-# -----------------------------
+# =========================================================
 st.sidebar.header("🔍 필터")
 
 gu_list = ["전체"] + sorted(df["자치구"].dropna().astype(str).unique())
@@ -309,9 +493,9 @@ if typ != "전체":
     df_f = df_f[df_f["유형"] == typ]
 
 
-# -----------------------------
+# =========================================================
 # KPI 영역
-# -----------------------------
+# =========================================================
 c1, c2, c3, c4 = st.columns(4)
 
 c1.metric("문화시설", len(df_f))
@@ -328,9 +512,9 @@ c4.metric("무료 비율", f"{free_ratio:.1f}%")
 st.divider()
 
 
-# -----------------------------
+# =========================================================
 # 차트 1: 자치구별 문화시설 수
-# -----------------------------
+# =========================================================
 col1, col2 = st.columns(2)
 
 with col1:
@@ -383,9 +567,9 @@ LIMIT 10;
 """)
 
 
-# -----------------------------
+# =========================================================
 # 차트 2: 문화공간 유형 분포
-# -----------------------------
+# =========================================================
 with col2:
     st.subheader("🎨 문화공간 유형 분포")
 
@@ -428,9 +612,9 @@ ORDER BY 개수 DESC;
 """)
 
 
-# -----------------------------
+# =========================================================
 # 차트 3: 무료 vs 유료 문화시설
-# -----------------------------
+# =========================================================
 st.subheader("💰 무료 vs 유료 문화시설 비율")
 
 d3 = df_f["무료구분"].fillna("정보없음").value_counts().reset_index()
@@ -471,9 +655,9 @@ st.write("""
 st.divider()
 
 
-# -----------------------------
+# =========================================================
 # 지도 시각화
-# -----------------------------
+# =========================================================
 st.subheader("🗺️ 문화시설 위치 지도")
 
 map_df = df_f.dropna(subset=["위도", "경도"]).copy()
@@ -500,9 +684,9 @@ else:
     st.plotly_chart(fig_map, use_container_width=True)
 
 
-# -----------------------------
+# =========================================================
 # 시설 목록 테이블
-# -----------------------------
+# =========================================================
 st.subheader("📋 문화시설 목록")
 
 table_cols = [
@@ -517,8 +701,8 @@ st.dataframe(
 )
 
 
-# -----------------------------
+# =========================================================
 # 하단 안내
-# -----------------------------
+# =========================================================
 st.divider()
-st.caption("※ CSV 파일은 app.py와 같은 폴더에 있어야 하며, 문화공간 파일명에는 '문화공간'이라는 단어가 포함되어 있어야 합니다.")
+st.caption("※ CSV 파일은 app.py와 같은 폴더 또는 하위 폴더에 있으면 자동으로 탐색됩니다.")
